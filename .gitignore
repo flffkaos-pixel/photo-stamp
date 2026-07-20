@@ -1,0 +1,11 @@
+.dart_tool/
+.packages
+.pub/
+build/
+flutter_*.png
+*.iml
+.idea/
+.metadata
+*.lock
+packages/
+.pub-cache/
