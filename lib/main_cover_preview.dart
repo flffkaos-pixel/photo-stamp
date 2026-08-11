@@ -13,29 +13,34 @@ import 'package:url_launcher/url_launcher.dart';
 
 String? _globalError;
 
-// Fire-and-forget trace logger — never blocks main isolate.
+// Synchronous trace logger — flushes immediately to survive native crashes.
 void _trace(String tag) {
-  // ignore: avoid_print
-  print('[PhotoStamp TRACE] $tag');
   final line = '[${DateTime.now().toIso8601String()}] $tag\n';
-  Future(() async {
-    final targets = <String>['/storage/emulated/0/PhotoStamp/trace.log'];
-    for (final path in targets) {
-      try {
-        final file = File(path);
-        await file.parent.create(recursive: true);
-        await file.writeAsString(line, mode: FileMode.append, flush: true);
-      } catch (_) {}
+  final targets = <String>['/storage/emulated/0/PhotoStamp/trace.log'];
+  try {
+    final storage = Directory('/storage');
+    if (storage.existsSync()) {
+      for (final d in storage.listSync().whereType<Directory>()) {
+        final name = d.path.split(Platform.pathSeparator).last;
+        if (name == 'emulated' || name == 'self') continue;
+        targets.add('${d.path}/PhotoStamp/trace.log');
+      }
     }
-  });
+  } catch (_) {}
+  for (final path in targets) {
+    try {
+      final file = File(path);
+      file.parent.createSync(recursive: true);
+      final raf = file.openSync(mode: FileMode.append);
+      raf.writeStringSync(line);
+      raf.flushSync();
+      raf.closeSync();
+    } catch (_) {}
+  }
 }
 
 Future<void> _reportError(Object error, StackTrace? stack) async {
   _globalError = '$error';
-  // ignore: avoid_print
-  print('[PhotoStamp ERROR] $error');
-  // ignore: avoid_print
-  print(stack);
   final entry = '[${DateTime.now()}]\n$error\n${stack ?? ''}\n${'=' * 40}\n';
   final targets = <String>['/storage/emulated/0/PhotoStamp/crash.log'];
   try {
@@ -55,7 +60,12 @@ Future<void> _reportError(Object error, StackTrace? stack) async {
       await file.writeAsString(entry, mode: FileMode.append);
     } catch (_) {}
   }
-  // path_provider는 Android 5.1.1 + 카메라 dispose 직후 hang/crash 유발 — 우회
+  try {
+    final doc = await getApplicationDocumentsDirectory();
+    final file = File('${doc.path}/crash.log');
+    await file.parent.create(recursive: true);
+    await file.writeAsString(entry, mode: FileMode.append);
+  } catch (_) {}
 }
 
 void main() {
@@ -530,13 +540,7 @@ class _StampCameraScreenState extends State<StampCameraScreen> {
 
   @override
   void dispose() {
-    // dispose를 다음 frame에서 비동기 실행. 실패해도 무시 (native crash 회피).
-    final controller = _controller;
-    _initFuture.then((_) async {
-      try {
-        await controller.dispose().timeout(const Duration(seconds: 1), onTimeout: () {});
-      } catch (_) {}
-    }).catchError((_) {});
+    _controller.dispose();
     super.dispose();
   }
 
@@ -800,8 +804,6 @@ class _StampCropScreenState extends State<StampCropScreen> {
   int? _photoW;
   int? _photoH;
   ui.Image? _maskImage;
-  Uint8List? _photoBytes;
-  String? _saveStatus;
 
   @override
   void initState() {
@@ -814,12 +816,8 @@ class _StampCropScreenState extends State<StampCropScreen> {
 
   Future<void> _preparePhoto() async {
     try {
-      _trace('preview: _preparePhoto start');
       final bytes = File(widget.imagePath).readAsBytesSync();
-      _trace('preview: read ${bytes.length}B');
-      _photoBytes = bytes;
       final decoded = img.decodeImage(bytes);
-      _trace('preview: decoded=${decoded != null}');
       if (decoded != null) {
         final oriented = img.bakeOrientation(decoded);
         _photoW = oriented.width;
@@ -856,19 +854,17 @@ class _StampCropScreenState extends State<StampCropScreen> {
   }
 
   Future<void> _saveStamp() async {
-    _trace('save: TAP');
-    if (mounted) setState(() => _saveStatus = 'SAVE TAP');
-    _trace('save: start');
+    _trace('preview: saveStamp start');
     try {
-      _trace('save: read bytes');
+      _trace('preview: before read');
       final photoBytes = File(widget.imagePath).readAsBytesSync();
-      _trace('save: bytes=${photoBytes.length}');
+      _trace('preview: bytes ${photoBytes.length}B');
 
-      _trace('save: decode');
+      _trace('preview: before decode');
       var src = img.decodeImage(photoBytes);
       if (src == null) throw Exception('디코딩 실패');
       src = img.bakeOrientation(src);
-      _trace('save: decoded=${src.width}x${src.height}');
+      _trace('preview: decoded ${src.width}x${src.height}');
 
       const outW = 720;
       const outH = 960;
@@ -896,7 +892,7 @@ class _StampCropScreenState extends State<StampCropScreen> {
         cropY = sy;
         cropW = sw;
         cropH = sh;
-        _trace('save: crop=${cropW}x${cropH}@($cropX,$cropY)');
+        _trace('preview: stamp-window crop $cropW x $cropH @ ($cropX,$cropY)');
       } else {
         // 폴백: 3:4 중앙 crop
         if (src.width / src.height > outW / outH) {
@@ -908,40 +904,50 @@ class _StampCropScreenState extends State<StampCropScreen> {
         }
         cropX = ((src.width - cropW) / 2).round().clamp(0, src.width - cropW);
         cropY = ((src.height - cropH) / 2).round().clamp(0, src.height - cropH);
-        _trace('save: fallback crop');
+        _trace('preview: fallback 3:4 crop');
       }
 
-      _trace('save: copyCrop');
       var cropped = img.copyCrop(src, x: cropX, y: cropY, width: cropW, height: cropH);
-      _trace('save: copyResize');
       final resized = img.copyResize(cropped, width: outW, height: outH, interpolation: img.Interpolation.average);
-      _trace('save: encodePng');
-      final png = img.encodePng(resized);
-      _trace('save: png=${png.length}B');
+      _trace('preview: resized ${resized.width}x${resized.height}');
 
-      // 저장: 메타 없이 PNG만 (안정 우선). 절대 pop 안 함.
-      // path_provider 우회: /data/data/com.pixel.photostamp/files 직접 사용
-      String? savedName;
-      try {
-        _trace('save: pre-dir');
-        final dir = Directory('/data/data/com.pixel.photostamp/files/stamps');
-        _trace('save: dir=${dir.path}');
-        if (!await dir.exists()) await dir.create(recursive: true);
-        final timestamp = DateTime.now().millisecondsSinceEpoch;
-        savedName = 'stamp_$timestamp.png';
-        _trace('save: writeFile');
-        await File('${dir.path}/$savedName').writeAsBytes(png);
-        _trace('save: write ok');
-        if (mounted) setState(() => _saveStatus = '저장 완료: $savedName');
-      } catch (we, ws) {
-        _trace('save: write fail $we');
-        _reportError(we, ws);
-        if (mounted) setState(() => _saveStatus = '저장 실패: $we');
+      // 마스크 알파 합성 (마스크 luminance로 src 합성)
+      var maskSrc = img.decodePng((await rootBundle.load('assets/stamp_mask.png')).buffer.asUint8List());
+      if (maskSrc != null) {
+        try {
+          final maskResized = img.copyResize(maskSrc, width: outW, height: outH, interpolation: img.Interpolation.average);
+          final composed = img.compositeImage(
+            resized,
+            resized,
+            mask: maskResized,
+            maskChannel: img.Channel.luminance,
+            blend: img.BlendMode.direct,
+          );
+          final png = img.encodePng(composed);
+          _trace('preview: png(masked) ${png.length}B');
+          await _writeStamp(png);
+          if (!mounted) return;
+          ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('스탬프 저장 완료!')));
+          Navigator.of(context).popUntil((route) => route.isFirst);
+          return;
+        } catch (me, ms) {
+          _trace('preview: mask composite fail $me — fallback to plain crop');
+          _reportError(me, ms);
+        }
       }
+
+      final png = img.encodePng(resized);
+      _trace('preview: png ${png.length}B');
+      await _writeStamp(png);
+
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('스탬프 저장 완료!')));
+      Navigator.of(context).popUntil((route) => route.isFirst);
     } catch (e, s) {
-      _trace('save: ERROR $e');
+      _trace('preview: saveStamp ERROR $e');
       _reportError(e, s);
-      if (mounted) setState(() => _saveStatus = '오류: $e');
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('저장 실패: $e')));
     }
   }
 
@@ -970,54 +976,40 @@ class _StampCropScreenState extends State<StampCropScreen> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: Text(_saveStatus ?? '미리보기'),
+        title: const Text('미리보기'),
         leading: IconButton(
           icon: const Icon(Icons.refresh),
           tooltip: '다시 찍기',
-          onPressed: _saveStatus != null ? null : _retake,
+          onPressed: _retake,
         ),
         actions: [
           IconButton(
-            onPressed: _saveStatus != null ? null : _saveStamp,
+            onPressed: _saveStamp,
             icon: const Icon(Icons.save),
             tooltip: '저장'),
         ],
       ),
       body: Column(
         children: [
-          Container(
-            width: double.infinity,
-            color: Colors.red,
-            padding: const EdgeInsets.all(8),
-            child: Text(
-              'BUILD: 2026-08-11-12:01 (cover preview + no pop)',
-              style: const TextStyle(color: Colors.white, fontSize: 11),
-            ),
-          ),
           Expanded(
             child: LayoutBuilder(
               builder: (context, constraints) {
                 final box = Size(constraints.maxWidth, constraints.maxHeight);
-                _screenBox ??= box;
-                final bytes = _photoBytes;
+                WidgetsBinding.instance.addPostFrameCallback((_) {
+                  if (mounted && _screenBox != box) {
+                    setState(() => _screenBox = box);
+                  }
+                });
                 return Stack(
                   fit: StackFit.expand,
                   children: [
                     Positioned.fill(
-                      child: Container(color: const Color(0xFF111111)),
-                    ),
-                    if (bytes != null)
-                      Positioned.fill(
-                        child: ColoredBox(
-                          color: const Color(0xFF333333),
-                          child: Center(
-                            child: Text(
-                              '사진 ${bytes.length}B (Image 제거됨)',
-                              style: const TextStyle(color: Colors.white70, fontSize: 12),
-                            ),
-                          ),
-                        ),
+                      child: Image.file(
+                        File(widget.imagePath),
+                        fit: BoxFit.cover,
+                        cacheWidth: 1080,
                       ),
+                    ),
                     Positioned.fill(
                       child: CustomPaint(
                         painter: _StampWindowPainter(),
@@ -1055,11 +1047,11 @@ class _StampCropScreenState extends State<StampCropScreen> {
     );
   }
 
-  void _retake() {
-    _trace('crop: retake TAP');
-    setState(() => _saveStatus = 'RETAKE TAP @ ${DateTime.now().second}s');
-    if (!mounted) return;
-    Navigator.of(context).pop();
+  Future<void> _retake() async {
+    _trace('crop: retake');
+    try {
+      Navigator.of(context).pop();
+    } catch (_) {}
   }
 }
 
