@@ -919,8 +919,27 @@ class _StampCropScreenState extends State<StampCropScreen> {
       final png = img.encodePng(resized);
       _trace('save: png=${png.length}B');
 
-      // 저장: 메타 없이 PNG만 (안정 우선). 절대 pop 안 함.
-      // path_provider 우회: /data/data/com.pixel.photostamp/files 직접 사용
+      // 마스크 알파 합성: stamp_mask.png (720x960)를 luminance로 dstIn 합성
+      Uint8List finalPng = png;
+      try {
+        _trace('save: mask composite start');
+        final maskBytes = await rootBundle.load('assets/stamp_mask.png');
+        final maskSrc = img.decodePng(maskBytes.buffer.asUint8List());
+        if (maskSrc != null) {
+          final mask = img.copyResize(maskSrc, width: 720, height: 960, interpolation: img.Interpolation.average);
+          final base = resized.convert(numChannels: 4);
+          final composed = img.compositeImage(base, base, mask: mask, maskChannel: img.Channel.luminance, blend: img.BlendMode.dstIn);
+          finalPng = img.encodePng(composed);
+          _trace('save: mask composite ok ${finalPng.length}B');
+        } else {
+          _trace('save: mask decode null, fallback plain');
+        }
+      } catch (me, ms) {
+        _trace('save: mask composite fail $me');
+        _reportError(me, ms);
+      }
+
+      // 저장: path_provider 우회: /data/data/com.pixel.photostamp/files 직접 사용
       String? savedName;
       try {
         _trace('save: pre-dir');
@@ -930,7 +949,7 @@ class _StampCropScreenState extends State<StampCropScreen> {
         final timestamp = DateTime.now().millisecondsSinceEpoch;
         savedName = 'stamp_$timestamp.png';
         _trace('save: writeFile');
-        await File('${dir.path}/$savedName').writeAsBytes(png);
+        await File('${dir.path}/$savedName').writeAsBytes(finalPng);
         _trace('save: write ok');
         if (mounted) setState(() => _saveStatus = '저장 완료: $savedName');
       } catch (we, ws) {
@@ -1004,18 +1023,14 @@ class _StampCropScreenState extends State<StampCropScreen> {
                   fit: StackFit.expand,
                   children: [
                     Positioned.fill(
-                      child: Container(color: const Color(0xFF111111)),
+                      child: Container(color: const Color(0xFF000000)),
                     ),
                     if (bytes != null)
                       Positioned.fill(
-                        child: ColoredBox(
-                          color: const Color(0xFF333333),
-                          child: Center(
-                            child: Text(
-                              '사진 ${bytes.length}B (Image 제거됨)',
-                              style: const TextStyle(color: Colors.white70, fontSize: 12),
-                            ),
-                          ),
+                        child: Image.memory(
+                          bytes,
+                          fit: BoxFit.contain,
+                          cacheWidth: 1080,
                         ),
                       ),
                     Positioned.fill(
